@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  serviceName: "redis-cluster"
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        appCluster: redis-cluster
+    spec:
+      readinessGates:
+      - conditionType: "www.example.com/feature-1"
+      serviceAccountName: modify-pods-sa
+      terminationGracePeriodSeconds: 20
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - redis
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: readiness
+        image: nginx
+        command: 
+        - bash
+        - -c
+        args: 
+        - |
+          apt update && apt install -y curl dnsutils jq && 
+          CLUSTERSET=$(echo ${HOSTNAME}.${MEMBERSHIP_NAME}.${SERVICE_NAME}.${NAMESPACE}.svc.clusterset.local) && 
+          while true;
+          do 
+            CONDITIONS=$(curl -sk -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" --header "Content-Type: application/json-patch+json" https://kubernetes.default.svc.cluster.local/api/v1/namespaces/${NAMESPACE}/pods/${HOSTNAME}/status | jq '.status .conditions') && 
+            INDEX=$(echo $CONDITIONS | jq 'to_entries[] | select(.value.type == "www.example.com/feature-1") | .key') && 
+            STATUS=$(echo $CONDITIONS | jq 'to_entries[] | select(.value.type == "www.example.com/feature-1") | .value.status') && 
+            NOW="$(date +'%Y-%m-%dT%H:%M:%SZ')" && 
+            POD_DNS_FROM_DIG=$(dig -x ${POD_IP} +short) && CLUSTERSET_IP=$(dig ${CLUSTERSET} +short) && 
+            if [ $(echo $POD_DNS_FROM_DIG) = $(echo ${HOSTNAME}.${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local.) ] && [ $(echo $POD_IP) = $(echo $CLUSTERSET_IP) ]; 
+            then 
+              echo dns name synchronized for myservice && 
+              TYPE=$(echo $CONDITIONS | jq 'to_entries[] | select(.value.type == "www.example.com/feature-1") | .value.type') && 
+              if [ -z "$TYPE" ]; 
+              then
+                curl -sk -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" --header "Content-Type: application/json-patch+json" --request PATCH $(echo https://kubernetes.default.svc.cluster.local/api/v1/namespaces/${NAMESPACE}/pods/${HOSTNAME}/status) --data '[ { "op": "add", "path":"/status/conditions/-", "value": { "lastProbeTime": null, "lastTransitionTime": "'"${NOW}"'", "status": "True", "type": "www.example.com/feature-1" }}]';
+              else 
+                echo $STATUS  && 
+                if [[ "${STATUS}" == *"False"* ]]; 
+                then 
+                  echo $INDEX && 
+                  curl -sk -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" --header "Content-Type: application/json-patch+json" --request PATCH $(echo https://kubernetes.default.svc.cluster.local/api/v1/namespaces/${NAMESPACE}/pods/${HOSTNAME}/status) --data '[ { "op": "replace", "path":"/status/conditions/'"${INDEX}"'", "value": { "lastProbeTime": null, "lastTransitionTime": "'"${NOW}"'", "status": "True", "type": "www.example.com/feature-1" }}]';
+                fi;
+              fi;
+              else 
+                echo not synced && 
+                if [[ "${STATUS}" == *"True"* ]]; 
+                then 
+                  curl -sk -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" --header "Content-Type: application/json-patch+json" --request PATCH $(echo https://kubernetes.default.svc.cluster.local/api/v1/namespaces/${NAMESPACE}/pods/${HOSTNAME}/status) --data '[ { "op": "replace", "path":"/status/conditions/'"${INDEX}"'", "value": { "lastProbeTime": null, "lastTransitionTime": "'"${NOW}"'", "status": "False", "type": "www.example.com/feature-1" }}]';
+                fi;
+              fi;
+            sleep 10; 
+          done
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: MEMBERSHIP_NAME
+          value: "mcss-demo-cluster"
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SERVICE_NAME
+          value: "redis-cluster"
+      - name: redis
+        image: "redis"
+        command:
+          - "redis-server"
+        args:
+          - "/conf/redis.conf"
+          - "--protected-mode"
+          - "no"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "100Mi"
+        ports:
+            - name: redis
+              containerPort: 6379
+              protocol: "TCP"
+            - name: cluster
+              containerPort: 16379
+              protocol: "TCP"
+        volumeMounts:
+        - name: conf
+          mountPath: /conf
+          readOnly: false
+        - name: data
+          mountPath: /data
+          readOnly: false
+      volumes:
+      - name: conf
+        configMap:
+          name: redis-cluster
+          defaultMode: 0755
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
